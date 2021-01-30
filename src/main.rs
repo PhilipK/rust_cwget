@@ -1,10 +1,13 @@
 use clap::Clap;
+use futures::future::join_all;
 use rayon::prelude::*;
 use std::fs::File;
+use std::io::copy;
 use std::io::{self, BufRead};
 use std::path::Path;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts: Opts = Opts::parse();
 
     let urls: Vec<String> = match read_lines(opts.input_file) {
@@ -21,20 +24,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .collect();
     let output_path = Path::new(&opts.output_folder);
 
-    let urls_to_download = urls.par_iter().filter_map(|url| {
-        let file_name = get_url_file_name(url);
-        if !output_path.join(&file_name).exists() {
-            Some((url, file_name))
-        } else {
-            None
-        }
-    });
+    let urls_to_download: Vec<_> = urls
+        .par_iter()
+        .filter_map(|url| {
+            let file_name = get_url_file_name(url);
+            if !output_path.join(&file_name).exists() {
+                Some((url, file_name))
+            } else {
+                None
+            }
+        })
+        .map(|(url, file_name)| download_url(output_path, (url, file_name)))
+        .collect();
 
-    urls_to_download.for_each(|(url, file_name)| {
-        println!("Downloading :  '{}' - '{}'", url, file_name);
-        let mut response = reqwest::blocking::get(url).unwrap();
+    join_all(urls_to_download).await;
+
+    Ok(())
+}
+
+async fn download_url(output_path: &Path, (url, file_name): (&String, String)) {
+    println!("Downloading :  '{}' - '{}'", url, file_name);
+    let resp = reqwest::get(url).await;
+    if let Ok(resp) = resp {
         let mut dest = {
-            let fname = response
+            let fname = resp
                 .url()
                 .path_segments()
                 .and_then(|segments| segments.last())
@@ -43,10 +56,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fname = output_path.join(fname);
             File::create(fname).unwrap()
         };
-        response.copy_to(&mut dest).unwrap();
-    });
-
-    Ok(())
+        let bytes = resp.bytes().await.unwrap();
+        let bufsved = bytes.to_vec();
+        let mut bufs = bufsved.as_slice();
+        copy(&mut bufs, &mut dest).unwrap();
+        println!("Downloaded :  '{}' - '{}'", url, file_name);
+    }
 }
 
 pub fn get_url_file_name(url: &String) -> String {
